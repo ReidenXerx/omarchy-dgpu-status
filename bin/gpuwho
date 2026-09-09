@@ -13,6 +13,7 @@
 #   gpuwho sleep              is the dGPU in deep sleep (D3cold) right now? (exit 0 = yes)
 #   gpuwho policy             show the default, what is opted in, and leftovers
 #   gpuwho watch [secs]       log every dGPU wake and name the process that caused it
+#   gpuwho why                why it wakes with nothing running (firmware NVPCF)
 #
 #   gpuwho allow <app>        let <app> SEE the dGPU and choose (game launchers)
 #   gpuwho allow --force <app>  force <app> onto the dGPU (GL + Vulkan)
@@ -353,6 +354,12 @@ gpu_holders() {
 # nothing to do with -- which reads as a mystery leak when it is really just a permanent
 # resident. So snapshot the residents up front and report only the newcomers as suspects.
 RESIDENTS=''
+# NVPCF (ACPI HID NVDA0820) is how the laptop's embedded controller negotiates power and
+# thermal budget with the GPU. When the firmware raises a Notify on it, the NVIDIA driver
+# takes a runtime-PM reference to answer -- so the card powers up with no process behind
+# it. Wakes like that are invisible to every userspace check, which is exactly what makes
+# them look like an unexplained leak.
+has_nvpcf() { [ -d /sys/bus/acpi/devices/NVDA0820:00 ]; }
 snapshot_residents() { RESIDENTS=" $(gpu_holders | sed 's/([0-9]*)//g') "; }
 is_resident() { case "$RESIDENTS" in *" $1 "*) return 0;; *) return 1;; esac; }
 
@@ -380,11 +387,24 @@ cmd_watch() {
     printf '  awake        : %ss' "$awake"
     [ "$total" -gt 0 ] && awk -v a="$awake" -v t="$total" 'BEGIN{printf "  (%.1f%% of the window)", 100*a/t}'
     echo
+    # A process that polls nvidia-smi on a timer never lets the card idle, so it produces
+    # ZERO wake events -- the card simply never sleeps. Counting wakes alone reports that
+    # as a quiet, healthy window, which is exactly backwards. Call it out explicitly.
+    if [ "$wakes" = 0 ] && [ "$prev" = D0 ] && [ "$total" -ge 20 ]; then
+      echo
+      echo "  ${c_red}The dGPU never slept during this window.${c_rst}"
+      echo "  ${c_dim}Zero wakes here does not mean idle — it means something is HOLDING the card,"
+      echo "  not waking it. A holder shows no wake events at all, so watching for wakes will"
+      echo "  never find it. Look for a poller instead:${c_rst}"
+      echo "    ${c_dim}nvidia-smi on a timer (system-monitor bar widgets are the usual culprit)${c_rst}"
+      echo "    ${c_dim}anything with /dev/nvidia* open: ${c_rst}gpuwho${c_dim} lists them${c_rst}"
+    fi
     if [ -s "$tally" ]; then
       echo "  ${c_bold}newly-arrived holders at wake time${c_rst}"
       sort "$tally" | uniq -c | sort -rn | head -8 | sed "s/^/    /"
     else
       echo "  ${c_dim}no holder caught in this window${c_rst}"
+      has_nvpcf && echo "  ${c_dim}this machine has an NVPCF device — see ${c_rst}gpuwho why${c_dim} for what that means.${c_rst}"
     fi
     # only nag about resolution when attribution actually failed
     if [ "$missed" -gt 0 ]; then
@@ -434,7 +454,11 @@ cmd_watch() {
         elif [ -n "$res_h" ]; then
           # Only long-lived residents were holding it. One of them poked the card, but the
           # fd list cannot say which -- claiming otherwise would be a guess dressed as data.
-          holders="${c_dim}only resident holders ($res_h) — no new process; cause not attributable from fds${c_rst}"
+          if has_nvpcf; then
+            holders="${c_dim}no new process — a short-lived config-space reader or a firmware notify (gpuwho why)${c_rst}"
+          else
+            holders="${c_dim}only resident holders ($res_h) — no new process; cause not attributable from fds${c_rst}"
+          fi
         else
           missed=$((missed + 1))
         fi
@@ -453,6 +477,67 @@ cmd_watch() {
     sleep "$poll"
   done
   _watch_summary
+}
+
+# ------------------------------------------------------------------ why
+# Explain wakes that no userspace tool can attribute, and hand over the one method that
+# actually answers the question. Everything below is read-only except the trace arming,
+# which is reverted before returning.
+cmd_why() {
+  echo "${c_bold}Why the dGPU wakes with nothing running${c_rst}"
+  echo
+  if has_nvpcf; then
+    echo "  This laptop exposes ${c_bold}NVDA0820${c_rst} (NVPCF) — the ACPI interface the embedded"
+    echo "  controller uses to negotiate power and thermal budget with the GPU."
+    echo
+    echo "  When the firmware raises a Notify on it, the NVIDIA driver answers like this:"
+    echo "    ${c_dim}acpi_ev_notify_dispatch -> rm_acpi_nvpcf_notify -> os_ref_dynamic_power${c_rst}"
+    echo "    ${c_dim}  -> nv_indicate_not_idle -> __pm_runtime_resume${c_rst}"
+    echo
+    echo "  nv_indicate_not_idle takes a runtime-PM reference, so the card powers up purely"
+    echo "  to service the notification, then suspends again. ${c_bold}No process is involved${c_rst} —"
+    echo "  which is why fd listings, /proc polling and udev monitoring all come up empty."
+    echo
+    echo "  This is the platform working as designed, not a leak. It happens in bursts tied"
+    echo "  to AC/battery, thermal and load changes rather than on a fixed interval."
+    echo "  ${c_dim}nvidia-powerd does not need to be running for it to occur, and the ~18s tail${c_rst}"
+    echo "  ${c_dim}is not tunable: power/autosuspend_delay_ms returns EIO because the driver${c_rst}"
+    echo "  ${c_dim}does not use the PM core's autosuspend at all.${c_rst}"
+    echo
+    echo "  ${c_bold}Before blaming firmware, rule out a config-space reader.${c_rst} A desktop shell that"
+    echo "  re-runs hardware probes (menu state, bar widgets) can call ${c_dim}lspci${c_rst} on a loop and"
+    echo "  produce exactly the same symptom — periodic wakes with no lasting process. That"
+    echo "  is far more common, and unlike NVPCF it is fixable. Check with:"
+    echo "    ${c_dim}sudo auditctl -a always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake${c_rst}"
+    echo "    ${c_dim}sudo ausearch -k lspciwake${c_rst}   ${c_dim}# then match timestamps against wakes${c_rst}"
+  else
+    echo "  ${c_dim}No NVPCF device (NVDA0820) on this machine, so firmware notifies are not${c_rst}"
+    echo "  ${c_dim}the usual explanation here.${c_rst}"
+  fi
+  echo
+  echo "${c_bold}Confirm it yourself${c_rst} ${c_dim}(needs root; reverts when done)${c_rst}"
+  cat <<EOS
+    sudo sh -c 'T=/sys/kernel/tracing
+      echo 0 > \$T/tracing_on; : > \$T/trace
+      echo 1 > \$T/events/rpm/rpm_resume/enable
+      echo "name ~ \\"$NV_PCI\\"" > \$T/events/rpm/rpm_resume/filter
+      echo 1 > \$T/options/stacktrace; echo 1 > \$T/tracing_on
+      sleep 300; cat \$T/trace
+      echo 0 > \$T/tracing_on
+      echo 0 > \$T/events/rpm/rpm_resume/enable
+      echo 0 > \$T/options/stacktrace
+      : > \$T/events/rpm/rpm_resume/filter'
+EOS
+  echo
+  echo "  ${c_dim}The tracepoint fires inside the kernel, so unlike a /proc poller it cannot be${c_rst}"
+  echo "  ${c_dim}outrun by a short-lived process. The filter field is 'name', not 'dev_name' —${c_rst}"
+  echo "  ${c_dim}getting that wrong silently traces every device instead of just this one.${c_rst}"
+  echo
+  echo "${c_bold}Other things that genuinely wake it${c_rst}"
+  echo "  ${c_dim}lspci / setpci${c_rst}  read PCI config space; the kernel resumes the card to answer"
+  echo "  ${c_dim}nvidia-smi${c_rst}      talks to the driver directly"
+  echo "  ${c_dim}current_link_speed${c_rst} and other config-space sysfs attributes"
+  echo "  ${c_dim}This tool reads only power_state and power/*, which never wake it.${c_rst}"
 }
 
 # ------------------------------------------------------------------ policy overview
@@ -494,11 +579,12 @@ case "${1:-who}" in
   sleep|deep|deepsleep) cmd_sleep ;;
   policy)          cmd_policy ;;
   watch)           cmd_watch "${2:-0}" ;;
+  why|explain)     cmd_why ;;
   allow)           shift; cmd_allow "$@" ;;
   unallow)         cmd_unallow "${2:-}" ;;
   pin)             cmd_pin "${2:-}" ;;
   unpin)           cmd_unpin "${2:-}" ;;
   list-pins|pins)  cmd_listpins ;;
-  -h|--help|help)  sed -n '2,26p' "$0" | sed 's/^# \{0,1\}//' ;;
+  -h|--help|help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' ;;
   *) die "unknown command '$1' (try: gpuwho --help)" ;;
 esac
