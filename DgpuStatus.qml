@@ -58,7 +58,10 @@ BarWidget {
 
   Process {
     id: pollProc
-    command: ["bash", "-lc", root.pollCmd]
+    // -c, not -lc: a LOGIN shell re-sources /etc/profile, profile.d and the user's
+    // bash_profile on every poll (42ms vs 4ms here, twelve times a minute) to run one
+    // cat. Nothing in pollCmd needs the login environment.
+    command: ["bash", "-c", root.pollCmd]
     stdout: StdioCollector {
       waitForEnd: true
       onStreamFinished: {
