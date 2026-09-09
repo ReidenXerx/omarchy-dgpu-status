@@ -25,8 +25,9 @@
 # Launcher overrides live in ~/.local/share/applications and shadow the packaged
 # .desktop via XDG precedence, so pacman upgrades are never touched. Any pre-existing
 # user override is backed up to <file>.gpuwho-bak and restored on unallow/unpin.
-# Resolve the NVIDIA device through its bound driver rather than a fixed address, so this
-# works on any machine. Falls back to the common single-dGPU slot if the driver is not bound.
+# Resolve the NVIDIA device from the driver's own binding rather than hardcoding a PCI
+# address. This copy ships to other people's laptops, where the dGPU is not necessarily
+# at 01:00.0. The literal is only a last-resort fallback.
 NV_SYS=$(ls -d /sys/bus/pci/drivers/nvidia/0000:* 2>/dev/null | head -1)
 [ -n "$NV_SYS" ] || NV_SYS="/sys/bus/pci/devices/0000:01:00.0"
 NV_PCI=$(basename "$NV_SYS")
@@ -347,6 +348,14 @@ gpu_holders() {
   printf '%s' "$out"
 }
 
+# A compositor keeps /dev/nvidia* open from login to logout. Naively reporting "who holds
+# it" at wake time therefore names that compositor for EVERY wake, including wakes it had
+# nothing to do with -- which reads as a mystery leak when it is really just a permanent
+# resident. So snapshot the residents up front and report only the newcomers as suspects.
+RESIDENTS=''
+snapshot_residents() { RESIDENTS=" $(gpu_holders | sed 's/([0-9]*)//g') "; }
+is_resident() { case "$RESIDENTS" in *" $1 "*) return 0;; *) return 1;; esac; }
+
 cmd_watch() {
   local dur="${1:-0}" poll="${GPUWHO_POLL:-1}"
   case "$dur" in (*[!0-9]*) die "usage: gpuwho watch [seconds]   (omit for until-Ctrl-C)";; esac
@@ -372,7 +381,7 @@ cmd_watch() {
     [ "$total" -gt 0 ] && awk -v a="$awake" -v t="$total" 'BEGIN{printf "  (%.1f%% of the window)", 100*a/t}'
     echo
     if [ -s "$tally" ]; then
-      echo "  ${c_bold}who held it${c_rst}"
+      echo "  ${c_bold}newly-arrived holders at wake time${c_rst}"
       sort "$tally" | uniq -c | sort -rn | head -8 | sed "s/^/    /"
     else
       echo "  ${c_dim}no holder caught in this window${c_rst}"
@@ -382,7 +391,13 @@ cmd_watch() {
       echo "  ${c_ylw}$missed wake(s) had no holder${c_rst} ${c_dim}— the process exited between samples.${c_rst}"
       echo "  ${c_dim}catch them with: GPUWHO_POLL=0.25 gpuwho watch${c_rst}"
     fi
-    echo "  ${c_dim}processes owned by other users are invisible without root.${c_rst}"
+    # This matters more than it sounds: nvidia-persistenced runs as its own user and
+    # holds /dev/nvidia* for the whole uptime, so an unprivileged watch cannot see it and
+    # will happily pin every wake on the compositor instead.
+    if [ "$(id -u)" != 0 ]; then
+      echo "  ${c_dim}root-owned holders (e.g. nvidia-persistenced) are invisible here —"
+      echo "  re-run as ${c_rst}sudo gpuwho watch${c_dim} to see them.${c_rst}"
+    fi
   }
   trap '_watch_summary; rm -f "$tally"; exit 0' INT TERM
 
@@ -390,6 +405,9 @@ cmd_watch() {
   # window while the GPU happens to be awake counts as a wake with no holder, which reads
   # as a mystery wake when it is really just the initial condition.
   prev=$(cat "$NV_SYS/power_state" 2>/dev/null || echo '?')
+  snapshot_residents
+  [ -n "${RESIDENTS// /}" ] && printf '  %b%s%b\n' "$c_dim" \
+    "resident holders (open /dev/nvidia* for the whole session):${RESIDENTS%% }" "$c_rst"
   if [ "$prev" = D0 ]; then
     wstart=$start
     printf '  %s  %b%-7s%b %s\n' "$(date +%H:%M:%S)" "$c_dim" "$prev" "$c_rst" \
@@ -405,9 +423,21 @@ cmd_watch() {
       now=$(date +%H:%M:%S)
       if [ "$ps" = D0 ]; then
         wakes=$((wakes + 1)); wstart=$(date +%s)
-        holders=$(gpu_holders)
-        if [ -n "$holders" ]; then printf '%s\n' $holders | sed 's/([0-9]*)$//' >> "$tally"
-      else missed=$((missed + 1)); fi
+        local h base new_h='' res_h=''
+        for h in $(gpu_holders); do
+          base=${h%%(*}
+          if is_resident "$base"; then res_h="${res_h:+$res_h }$h"; else new_h="${new_h:+$new_h }$h"; fi
+        done
+        if [ -n "$new_h" ]; then
+          printf '%s\n' $new_h | sed 's/([0-9]*)$//' >> "$tally"
+          holders="$new_h"
+        elif [ -n "$res_h" ]; then
+          # Only long-lived residents were holding it. One of them poked the card, but the
+          # fd list cannot say which -- claiming otherwise would be a guess dressed as data.
+          holders="${c_dim}only resident holders ($res_h) — no new process; cause not attributable from fds${c_rst}"
+        else
+          missed=$((missed + 1))
+        fi
         printf '  %s  %b%-7s%b %s\n' "$now" "$c_red" "$ps" "$c_rst" \
           "${holders:-${c_dim}<nothing held it — short-lived waker>${c_rst}}"
       else
