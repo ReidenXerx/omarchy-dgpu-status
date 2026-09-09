@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "id": "reidenxerx.dgpu-status",
+  "name": "dGPU status",
+  "version": "1.0.0",
+  "author": "ReidenXerx",
+  "description": "Shows whether the NVIDIA discrete GPU is asleep or awake. Dim when powered off, amber when idling powered, red when in use.",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "DgpuStatus.qml" },
+  "barWidget": {
+    "displayName": "dGPU status",
+    "description": "NVIDIA discrete GPU sleep depth at a glance; click for what is holding it awake",
+    "category": "Hardware",
+    "allowMultiple": false
+  }
+}
