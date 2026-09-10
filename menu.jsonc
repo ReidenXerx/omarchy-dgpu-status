@@ -1,0 +1,30 @@
+  "setup.dgpu": {
+    "icon": "󰢮",
+    "label": "Discrete GPU",
+    "aliases": ["gpu", "nvidia", "dgpu", "prime", "graphics"]
+  },
+  "setup.dgpu.status": {
+    "icon": "󰈻",
+    "label": "Power state",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho status"
+  },
+  "setup.dgpu.who": {
+    "icon": "󰅩",
+    "label": "What is using it",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho"
+  },
+  "setup.dgpu.policy": {
+    "icon": "󰒓",
+    "label": "Policy and opted-in apps",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho policy"
+  },
+  "setup.dgpu.watch": {
+    "icon": "󰄉",
+    "label": "Watch for wakes (60s)",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho watch 60"
+  },
+  "setup.dgpu.why": {
+    "icon": "󰘥",
+    "label": "Why does it wake?",
+    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho why"
+  },

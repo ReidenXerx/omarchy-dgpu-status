@@ -72,6 +72,35 @@ sleeping card. If you extend this, keep to `power_state`, `power/runtime_*` and 
   non-forcing variant, a small `gpu-unblock` wrapper; see the comments in `bin/gpuwho`.
 - Processes owned by other users are invisible without root.
 
+## Requirements
+
+Nothing beyond a stock Omarchy install and an NVIDIA card bound to the `nvidia` driver.
+`gpuwho` reads only `/proc` and sysfs power attributes — never `lspci`, `nvidia-smi`, or
+`current_link_speed`, all of which would wake the GPU it is reporting on.
+
+## Menu entries
+
+Optional Omarchy menu routes (power state, what is using it, policy, watch, why):
+
+```bash
+bin/dgpu-status-menu-install          # add them
+bin/dgpu-status-menu-install remove   # take them out
+```
+
+It writes only between its own marker comments in
+`~/.config/omarchy/extensions/omarchy-menu.jsonc` and rolls back rather than leaving that
+file unparseable.
+
+## Remove
+
+```bash
+bin/dgpu-status-menu-install remove
+omarchy plugin remove reidenxerx.dgpu-status
+```
+
+The widget keeps no state of its own. Any `gpuwho allow` opt-ins you made live in
+`~/.local/share/applications` and `~/.local/bin`; `gpuwho unallow <app>` reverts them.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
