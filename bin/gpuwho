@@ -377,8 +377,8 @@ cmd_watch() {
 }
 
 # ------------------------------------------------------------------ why
-# Explain wakes that no userspace tool can attribute, and print (never run) the root-only
-# recipes that actually answer the question.
+# Explain wakes that no userspace tool can attribute. The root-only recipes that settle
+# the question live in the README ("Diagnosing wakes"); this tool never runs them.
 cmd_why() {
   resolve_device || true
   local addr=${NV_PCI:-<pci-address>}
@@ -405,29 +405,21 @@ cmd_why() {
   ${c_bold}Before blaming firmware, rule out a config-space reader.${c_rst} A desktop shell that
   re-runs hardware probes (menu state, bar widgets) can call ${c_dim}lspci${c_rst} on a loop and
   produce exactly the same symptom — periodic wakes with no lasting process. That
-  is far more common, and unlike NVPCF it is fixable. Check with:
-    ${c_dim}sudo auditctl -a always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake${c_rst}
-    ${c_dim}sudo ausearch -k lspciwake${c_rst}   ${c_dim}# then match timestamps against wakes${c_rst}
+  is far more common, and unlike NVPCF it is fixable. An audit rule on lspci shows
+  whether that is happening; the README's "Diagnosing wakes" section has the recipe.
 EOS
   else
     printf '  %sNo NVPCF device (NVDA0820) on this machine, so firmware notifies are not%s\n' "$c_dim" "$c_rst"
     printf '  %sthe usual explanation here.%s\n' "$c_dim" "$c_rst"
   fi
   echo
-  printf '%sConfirm it yourself%s %s(needs root; reverts when done)%s\n' "$c_bold" "$c_rst" "$c_dim" "$c_rst"
-  [[ -n $NV_PCI ]] || printf '  %sno device is bound to the nvidia driver right now; put its PCI address in the filter%s\n' "$c_dim" "$c_rst"
+  printf '%sConfirm it yourself%s\n' "$c_bold" "$c_rst"
+  [[ -n $NV_PCI ]] || printf '  %sno device is bound to the nvidia driver right now%s\n' "$c_dim" "$c_rst"
   # addr is either a validated PCI address or the fixed placeholder, so it is inert here.
   cat <<EOS
-    sudo sh -c 'T=/sys/kernel/tracing
-      echo 0 > \$T/tracing_on; : > \$T/trace
-      echo 1 > \$T/events/rpm/rpm_resume/enable
-      echo "name ~ \\"$addr\\"" > \$T/events/rpm/rpm_resume/filter
-      echo 1 > \$T/options/stacktrace; echo 1 > \$T/tracing_on
-      sleep 300; cat \$T/trace
-      echo 0 > \$T/tracing_on
-      echo 0 > \$T/events/rpm/rpm_resume/enable
-      echo 0 > \$T/options/stacktrace
-      : > \$T/events/rpm/rpm_resume/filter'
+  A kernel tracepoint on runtime-PM resumes, filtered to ${c_bold}${addr}${c_rst}, shows the exact
+  call chain behind every wake. It needs root, so this tool does not run it: the recipe
+  is in the README under "Diagnosing wakes".
 EOS
   cat <<EOS
 

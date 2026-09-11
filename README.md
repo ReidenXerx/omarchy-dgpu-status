@@ -58,6 +58,43 @@ summary over 9s
 wrappers, launchers or configuration. (Earlier development versions had `pin`/`allow`
 commands that did; they are not shipped.)
 
+## Diagnosing wakes
+
+`gpuwho watch` names the process behind a wake when there is one. When there is none,
+two root-only checks settle it. The plugin only documents them and never runs them.
+
+**Is something reading PCI config space?** A desktop shell that probes hardware with
+`lspci` on a loop wakes the card with no lasting process — the most common cause, and a
+fixable one:
+
+```bash
+sudo auditctl -a always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake
+sudo ausearch -k lspciwake      # match the timestamps against gpuwho watch
+sudo auditctl -d always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake   # remove the rule
+```
+
+**What exactly resumed the card?** A tracepoint on runtime-PM resumes, with the kernel
+call chain. Use the PCI address `gpuwho status` prints in its first line:
+
+```bash
+sudo sh -c 'T=/sys/kernel/tracing
+  echo 0 > $T/tracing_on; : > $T/trace
+  echo 1 > $T/events/rpm/rpm_resume/enable
+  echo "name ~ \"0000:01:00.0\"" > $T/events/rpm/rpm_resume/filter
+  echo 1 > $T/options/stacktrace; echo 1 > $T/tracing_on
+  sleep 300; cat $T/trace
+  echo 0 > $T/tracing_on
+  echo 0 > $T/events/rpm/rpm_resume/enable
+  echo 0 > $T/options/stacktrace
+  : > $T/events/rpm/rpm_resume/filter'
+```
+
+The tracepoint fires inside the kernel, so unlike a `/proc` poller a short-lived process
+cannot outrun it. The filter field is `name`, not `dev_name`: getting that wrong silently
+traces every device instead of this one. On laptops with an NVPCF device (`NVDA0820`), a
+trace ending in `rm_acpi_nvpcf_notify` is firmware negotiating power budget — expected,
+and not fixable from userspace.
+
 ## The rule this is built around
 
 Everything here reads **only** `power_state`, the runtime PM attributes (`power/runtime_status`,
