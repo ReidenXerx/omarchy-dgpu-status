@@ -1,5 +1,7 @@
 # dGPU status
 
+![dGPU status](preview.png)
+
 An [Omarchy](https://omarchy.org) bar widget showing whether the NVIDIA discrete GPU is
 **asleep or awake**, plus [`gpuwho`](#gpuwho) — a CLI for seeing what is keeping it awake.
 
