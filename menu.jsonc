@@ -1,3 +1,5 @@
+  // Actions go through bash twice (the menu, then the launcher's bash -c). The inner
+  // double quotes keep the plugin path a single word at the second parse.
   "setup.dgpu": {
     "icon": "󰢮",
     "label": "Discrete GPU",
@@ -6,25 +8,20 @@
   "setup.dgpu.status": {
     "icon": "󰈻",
     "label": "Power state",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho status"
+    "action": "/usr/bin/omarchy-launch-floating-terminal-with-presentation '\"@PLUGIN_BIN@/gpuwho\" status'"
   },
   "setup.dgpu.who": {
     "icon": "󰅩",
     "label": "What is using it",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho"
-  },
-  "setup.dgpu.policy": {
-    "icon": "󰒓",
-    "label": "Policy and opted-in apps",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho policy"
+    "action": "/usr/bin/omarchy-launch-floating-terminal-with-presentation '\"@PLUGIN_BIN@/gpuwho\"'"
   },
   "setup.dgpu.watch": {
     "icon": "󰄉",
     "label": "Watch for wakes (60s)",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho watch 60"
+    "action": "/usr/bin/omarchy-launch-floating-terminal-with-presentation '\"@PLUGIN_BIN@/gpuwho\" watch 60'"
   },
   "setup.dgpu.why": {
     "icon": "󰘥",
     "label": "Why does it wake?",
-    "action": "omarchy-launch-floating-terminal-with-presentation @PLUGIN_BIN@/gpuwho why"
+    "action": "/usr/bin/omarchy-launch-floating-terminal-with-presentation '\"@PLUGIN_BIN@/gpuwho\" why'"
   },

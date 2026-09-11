@@ -1,526 +1,427 @@
-#!/usr/bin/env bash
-# gpuwho — inspect and control which GPU apps use on this Optimus laptop.
+#!/usr/bin/bash
+# gpuwho -- what is keeping the NVIDIA discrete GPU awake. Read-only.
 #
-# POLICY (inverted, since ~/.config/environment.d/90-gpu-default-igpu.conf):
-#   the session hides the NVIDIA Vulkan ICD, so the default for EVERY app is the
-#   Intel iGPU and nothing can wake the dGPU by accident. Access is granted per app.
-#   OpenGL already defaulted to Intel; Vulkan did not — that was the leak.
+# Reads /proc and exactly these sysfs attributes of the PCI device bound to the nvidia
+# driver: power_state, power/runtime_status, power/runtime_suspended_time,
+# power/runtime_active_time, power/control and d3cold_allowed. The kernel answers those
+# from cached state, so reading them never wakes the GPU.
 #
-# Reading state never wakes the GPU (pure /proc + sysfs).
+# Never add lspci, setpci, nvidia-smi, an open() of /dev/nvidia*, or a read of the
+# device's config, current_link_speed or current_link_width: each reaches PCI config
+# space or the driver, and the kernel resumes a sleeping card to answer -- the tool would
+# manufacture the very wakes it reports.
 #
-#   gpuwho                    list processes currently on the dGPU
-#   gpuwho status             dGPU power state + asleep%
-#   gpuwho sleep              is the dGPU in deep sleep (D3cold) right now? (exit 0 = yes)
-#   gpuwho policy             show the default, what is opted in, and leftovers
-#   gpuwho watch [secs]       log every dGPU wake and name the process that caused it
-#   gpuwho why                why it wakes with nothing running (firmware NVPCF)
-#
-#   gpuwho allow <app>        let <app> SEE the dGPU and choose (game launchers)
-#   gpuwho allow --force <app>  force <app> onto the dGPU (GL + Vulkan)
-#   gpuwho unallow <app>      revoke, back to iGPU-only
-#   prime-run <cmd>           one-off dGPU run from a terminal
-#
-#   gpuwho pin/unpin/list-pins   legacy per-app iGPU pinning — redundant now that
-#                                iGPU is the default; kept to undo old pins.
-#
-# Launcher overrides live in ~/.local/share/applications and shadow the packaged
-# .desktop via XDG precedence, so pacman upgrades are never touched. Any pre-existing
-# user override is backed up to <file>.gpuwho-bak and restored on unallow/unpin.
-# Resolve the NVIDIA device from the driver's own binding rather than hardcoding a PCI
-# address. This copy ships to other people's laptops, where the dGPU is not necessarily
-# at 01:00.0. The literal is only a last-resort fallback.
-NV_SYS=$(ls -d /sys/bus/pci/drivers/nvidia/0000:* 2>/dev/null | head -1)
-[ -n "$NV_SYS" ] || NV_SYS="/sys/bus/pci/devices/0000:01:00.0"
-NV_PCI=$(basename "$NV_SYS")
-INTEL_ICD="/usr/share/vulkan/icd.d/intel_icd.json"
-MESA_EGL="/usr/share/glvnd/egl_vendor.d/50_mesa.json"
-BINDIR="$HOME/.local/bin"
-APPDIR="$HOME/.local/share/applications"
-SYS_APP_DIRS=(/usr/share/applications /usr/local/share/applications)
-TAG="# gpuwho-intel-pin"                 # marks our bin wrappers
-DTAG="X-GpuWho-Pinned=true"              # marks our .desktop overrides
+# It writes nothing: no configuration, no wrappers, no launchers, no temporary files.
 
-# the environment that forces an app onto Intel (no spaces in any value)
-pin_env_kv() {   # prints "K=V K=V ..." for use after `env`
-  printf '%s' "VK_ICD_FILENAMES=$INTEL_ICD __GLX_VENDOR_LIBRARY_NAME=mesa __EGL_VENDOR_LIBRARY_FILENAMES=$MESA_EGL DRI_PRIME=0"
-}
+PATH=/usr/bin
+LC_ALL=C
+export PATH LC_ALL
+set -u
+shopt -s nullglob
 
-c_bold=$'\e[1m'; c_dim=$'\e[2m'; c_grn=$'\e[32m'; c_ylw=$'\e[33m'; c_red=$'\e[31m'; c_rst=$'\e[0m'
-[ -t 1 ] || { c_bold=; c_dim=; c_grn=; c_ylw=; c_red=; c_rst=; }
-die() { echo "${c_red}error:${c_rst} $*" >&2; exit 1; }
-refresh_menu() { command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$APPDIR" 2>/dev/null || true; }
-
-# Classify dGPU sleep depth from SAFE sysfs reads that never wake the GPU.
-# power_state: D0 = awake, D3hot = light sleep (still powered), D3cold = deep
-# sleep (fully powered off — the real battery win). Echoes "code|human string".
-# NOTE: deliberately avoids current_link_speed/width — reading those queries the
-# live PCIe link and resumes the GPU (observed D3cold->D0). Do not add them here.
-gpu_sleep_state() {
-  local ps rs
-  ps=$(cat "$NV_SYS/power_state" 2>/dev/null || echo "?")
-  rs=$(cat "$NV_SYS/power/runtime_status" 2>/dev/null || echo "?")
-  case "$ps" in
-    D3cold) echo "deep|${c_grn}DEEP sleep (D3cold — fully powered off)${c_rst}" ;;
-    D3hot)  echo "light|${c_ylw}light sleep (D3hot — powered, idle)${c_rst}" ;;
-    D0)     [ "$rs" = active ] && echo "active|${c_red}awake (D0 — active)${c_rst}" \
-                              || echo "trans|${c_ylw}transitioning (D0/${rs})${c_rst}" ;;
-    *)      echo "unknown|${c_dim}unknown (power_state=${ps})${c_rst}" ;;
-  esac
-}
-
-# ------------------------------------------------------------------ who / status
-cmd_who() {
-  [ -e /dev/nvidia0 ] || die "no /dev/nvidia0 (dGPU driver not loaded?)"
-  local ss; ss=$(gpu_sleep_state)
-  echo "${c_bold}Processes on the NVIDIA dGPU${c_rst} ${c_dim}—${c_rst} ${ss#*|}"
-  local pids
-  pids=$(fuser /dev/nvidia0 /dev/nvidiactl /dev/nvidia-modeset 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -u)
-  if [ -z "$pids" ]; then echo "  ${c_grn}nothing is using the dGPU${c_rst} — it can sleep."; return 0; fi
-  printf "  ${c_dim}%-8s %-22s %-7s %s${c_rst}\n" "PID" "COMMAND" "NV-FDS" "MODE"
-  for p in $pids; do
-    [ -d "/proc/$p" ] || continue
-    local comm nvfd infd mode
-    comm=$(cat "/proc/$p/comm" 2>/dev/null || echo "?")
-    nvfd=$(ls -l "/proc/$p/fd" 2>/dev/null | grep -c '/dev/nvidia')
-    infd=$(ls -l "/proc/$p/fd" 2>/dev/null | grep -cE 'renderD128|card1')
-    if grep -qE '/dev/nvidia[0-9]' "/proc/$p/maps" 2>/dev/null; then mode="${c_red}rendering${c_rst}"
-    elif [ "$infd" -gt 0 ]; then mode="${c_ylw}holding (renders on Intel)${c_rst}"
-    else mode="${c_dim}holding${c_rst}"; fi
-    printf "  %-8s %-22s %-7s %b\n" "$p" "${comm:0:22}" "$nvfd" "$mode"
-  done
-  echo; echo "  ${c_dim}'rendering' apps wake the dGPU. Pin one with:${c_rst} gpuwho pin <command>"
-}
-
-cmd_status() {
-  local st ctrl asleep awake pct
-  st=$(cat "$NV_SYS/power/runtime_status" 2>/dev/null || echo "?")
-  ctrl=$(cat "$NV_SYS/power/control" 2>/dev/null || echo "?")
-  asleep=$(cat "$NV_SYS/power/runtime_suspended_time" 2>/dev/null || echo 0)
-  awake=$(cat "$NV_SYS/power/runtime_active_time" 2>/dev/null || echo 0)
-  pct=$(awk "BEGIN{t=$asleep+$awake; printf (t>0)?\"%.0f\":\"?\", (t>0)?100*$asleep/t:0}")
-  echo "${c_bold}dGPU power${c_rst} ($NV_PCI)"
-  echo "  runtime_status : $st"
-  echo "  power/control  : $ctrl        ${c_dim}(auto = RTD3 allowed)${c_rst}"
-  echo "  d3cold_allowed : $(cat "$NV_SYS/d3cold_allowed" 2>/dev/null)"
-  local ss; ss=$(gpu_sleep_state)
-  echo "  power_state    : $(cat "$NV_SYS/power_state" 2>/dev/null 2>&1)   ${c_dim}(D0 awake / D3hot light / D3cold deep)${c_rst}"
-  echo "  right now      : ${ss#*|}"
-  awk "BEGIN{printf \"  asleep         : %.1f h\n\", $asleep/3600000}"
-  awk "BEGIN{printf \"  awake          : %.1f h\n\", $awake/3600000}"
-  echo "  ${c_bold}asleep ${pct}% of the time${c_rst}  ${c_dim}(higher = more battery saved)${c_rst}"
-}
-
-cmd_sleep() {   # quick one-liner; exit status 0 iff the dGPU is in deep sleep (scriptable)
-  local ss code; ss=$(gpu_sleep_state); code=${ss%%|*}
-  echo "dGPU: ${ss#*|}  ${c_dim}[power_state=$(cat "$NV_SYS/power_state" 2>/dev/null), runtime=$(cat "$NV_SYS/power/runtime_status" 2>/dev/null)]${c_rst}"
-  [ "$code" = deep ]
-}
+if [[ -t 1 ]]; then
+  c_bold=$'\e[1m' c_dim=$'\e[2m' c_grn=$'\e[32m' c_ylw=$'\e[33m' c_red=$'\e[31m' c_rst=$'\e[0m'
+else
+  c_bold='' c_dim='' c_grn='' c_ylw='' c_red='' c_rst=''
+fi
 
 # ------------------------------------------------------------------ helpers
-resolve_real() { # real binary for <name>, skipping our own wrappers
-  local name="$1" p
-  while IFS= read -r p; do
-    [ -x "$p" ] || continue
-    grep -q "$TAG" "$p" 2>/dev/null && continue
-    echo "$p"; return 0
-  done < <(which -a "$name" 2>/dev/null)
+# clean <var> <text> [max]: printable ASCII only, truncated. Everything that did not come
+# from this script (arguments, process names) is printed through this, so it cannot carry
+# terminal escape sequences.
+clean() {
+  local _clean_s=${2:0:${3:-64}}
+  printf -v "$1" '%s' "${_clean_s//[^[:print:]]/?}"
+}
+
+die() {
+  local _msg
+  clean _msg "$*" 200
+  printf '%serror:%s %s\n' "$c_red" "$c_rst" "$_msg" >&2
+  exit 1
+}
+
+# ------------------------------------------------------------------ the device
+BDF_RE='^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$'
+NV_SYS='' NV_PCI=''
+
+# Resolve the device from the driver's own binding, not a hardcoded address: entries of
+# /sys/bus/pci/drivers/nvidia named like a PCI address whose symlink leads to a directory
+# of the same name under /sys/devices/. Only directory lookups -- nothing is opened.
+resolve_device() {
+  local entry name real n=0
+  for entry in /sys/bus/pci/drivers/nvidia/*; do
+    (( ++n > 256 )) && break
+    name=${entry##*/}
+    [[ $name =~ $BDF_RE ]] || continue
+    real=$(realpath -e -- "$entry" 2>/dev/null) || continue
+    [[ $real == /sys/devices/*/"$name" && ! $real =~ [^A-Za-z0-9:._/-] ]] || continue
+    [[ -d $real && ! -L $real && -f $real/power_state && ! -L $real/power_state ]] || continue
+    NV_SYS=$real NV_PCI=$name
+    return 0
+  done
   return 1
 }
 
-find_desktops() { # <query> -> matching .desktop paths (system + user), deduped by name
-  # matches by: filename id, first real Exec token (skipping env/VAR=val), or Name=.
-  # System dirs are searched first so the system copy is the injection source.
-  local q="$1" d f base nm execval first
-  { for d in "${SYS_APP_DIRS[@]}" "$APPDIR"; do
-      [ -d "$d" ] || continue
-      for f in "$d"/*.desktop; do
-        [ -f "$f" ] || continue
-        base=$(basename "$f")
-        nm=$(grep -m1 '^Name=' "$f" 2>/dev/null | sed 's/^Name=//')
-        execval=$(grep -m1 '^Exec=' "$f" 2>/dev/null | sed 's/^Exec=//')
-        first=$(awk '{for(i=1;i<=NF;i++){t=$i; if(t!="env" && t !~ /=/){gsub(/"/,"",t); print t; exit}}}' <<<"$execval"); first=${first##*/}
-        if [ "${base%.desktop}" = "$q" ] || [ "$first" = "$q" ] \
-           || printf '%s' "$base" | grep -qi -- "$q" \
-           || printf '%s' "$nm" | grep -qix -- "$q"; then
-          printf '%s\t%s\n' "$base" "$f"
-        fi
-      done
-    done; } | awk -F'\t' '!seen[$1]++{print $2}'
+require_device() {
+  resolve_device || die "no PCI device is bound to the nvidia driver"
 }
 
-# Pin one .desktop onto Intel by injecting the GPU env into every Exec= line.
-# System file  -> a shadow copy in ~/.local/share/applications.
-# User file    -> edited in place (can't be shadowed; it's already top precedence).
-# Either way the original is backed up to <file>.gpuwho-bak and restored on unpin.
-apply_desktop_pin() {
-  local src="$1" base ov inplace=0
-  base=$(basename "$src"); ov="$APPDIR/$base"; mkdir -p "$APPDIR"
-  [ "$(dirname "$src")" = "$APPDIR" ] && inplace=1
-  if [ -e "$ov" ] && grep -q "$DTAG" "$ov" 2>/dev/null; then echo "  already pinned: $ov"; return 0; fi
-  if [ "$inplace" = 1 ]; then cp -a "$src" "$ov.gpuwho-bak"; echo "  backed up original -> $ov.gpuwho-bak"
-  elif [ -e "$ov" ]; then cp -a "$ov" "$ov.gpuwho-bak"; echo "  ${c_ylw}backed up your existing override${c_rst} -> $ov.gpuwho-bak"; fi
-  awk -v mv="$(pin_env_kv)" -v tag="$DTAG" '
-    /^\[Desktop Entry\]/ { print; print tag; next }
-    /^Exec=/ {
-      line=substr($0,6)
-      if (index(line,"VK_ICD_FILENAMES=")>0) { print; next }          # already has our env
-      if (line ~ /^env /) sub(/^env /, "env " mv " ", line); else line="env " mv " " line
-      print "Exec=" line; next
-    }
-    { print }
-  ' "$src" > "$ov.tmp" && mv "$ov.tmp" "$ov"
-  echo "  desktop pin: $ov ${c_dim}($([ "$inplace" = 1 ] && echo 'edited in place' || echo 'shadows system file'))${c_rst}"
-  command -v desktop-file-validate >/dev/null 2>&1 && desktop-file-validate "$ov" 2>&1 | grep -viE 'hint:' | sed 's/^/    validate: /' || true
-}
-
-remove_desktop_override() { # <.desktop path> — restores/removes the pin by basename
-  local src="$1" base ov; base=$(basename "$src"); ov="$APPDIR/$base"
-  [ -e "$ov" ] || return 0
-  if ! grep -q "$DTAG" "$ov" 2>/dev/null; then echo "  ${c_dim}$ov is not ours — left alone${c_rst}"; return 0; fi
-  if [ -e "$ov.gpuwho-bak" ]; then mv -f "$ov.gpuwho-bak" "$ov"; echo "  ${c_grn}restored original launcher${c_rst}: $ov"
-  else rm -f "$ov"; echo "  removed desktop override: $ov"; fi
-}
-
-# ------------------------------------------------------------------ pin / unpin
-cmd_pin() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: gpuwho pin <command|app>"
-  [ -f "$INTEL_ICD" ] || die "intel vulkan ICD not found at $INTEL_ICD"
-  local did=0
-
-  # layer 1: terminal wrapper — ONLY if a real binary of that name is in PATH
-  local real
-  if real=$(resolve_real "$name"); then
-    local wrapper="$BINDIR/$name"
-    if [ -e "$wrapper" ] && ! grep -q "$TAG" "$wrapper" 2>/dev/null; then
-      die "$wrapper exists and is not a gpuwho pin — refusing to overwrite"
-    fi
-    mkdir -p "$BINDIR"
-    { echo "#!/usr/bin/env bash"; echo "$TAG"
-      echo "# Forces '$name' onto the Intel iGPU. Remove with: gpuwho unpin $name"
-      echo "export $(pin_env_kv)"; echo "exec \"$real\" \"\$@\""
-    } > "$wrapper"; chmod +x "$wrapper"
-    echo "${c_grn}pinned${c_rst} $name -> Intel iGPU"
-    echo "  wrapper: $wrapper  ${c_dim}(-> $real)${c_rst}"; did=1
-  else
-    echo "  ${c_dim}no '$name' binary in PATH — pinning via .desktop launcher(s)${c_rst}"
+# attr <var> <attribute>: one allowlisted power attribute of the device, or '?'.
+attr() {
+  local _attr_v=''
+  case $2 in
+    power_state|power/runtime_status|power/runtime_suspended_time|power/runtime_active_time|power/control|d3cold_allowed) ;;
+    *) die "internal: refusing to read '$2' (not a power attribute)" ;;
+  esac
+  if [[ -n $NV_SYS ]]; then
+    IFS= read -r -n 32 _attr_v 2>/dev/null < "$NV_SYS/$2" || true
   fi
+  [[ $_attr_v =~ ^[A-Za-z0-9_]{1,32}$ ]] || _attr_v='?'
+  printf -v "$1" '%s' "$_attr_v"
+}
 
-  # layer 2: .desktop launcher(s) — system OR user (covers Electron/AppImage/GUI-only apps)
-  local ds; ds=$(find_desktops "$name")
-  if [ -n "$ds" ]; then
-    while IFS= read -r d; do [ -n "$d" ] && { echo "  ${c_bold}match:${c_rst} $d"; apply_desktop_pin "$d"; did=1; }; done <<<"$ds"
-    refresh_menu
+# attr_num <var> <attribute>: a counter attribute as a non-negative integer (0 if unreadable).
+attr_num() {
+  attr "$1" "$2"
+  [[ ${!1} =~ ^[0-9]{1,15}$ ]] || printf -v "$1" '%s' 0
+}
+
+# hours <ms>: milliseconds as hours with one decimal, rounded.
+hours() {
+  local t=$(( ($1 * 10 + 1800000) / 3600000 ))
+  printf '%d.%d' $(( t / 10 )) $(( t % 10 ))
+}
+
+# Sets SS_CODE (deep|light|active|trans|unknown) and SS_TEXT from power_state and
+# runtime_status. D0 = awake, D3hot = light sleep (still powered), D3cold = deep sleep
+# (fully powered off -- the real battery win).
+sleep_state() {
+  local ps rs
+  attr ps power_state
+  attr rs power/runtime_status
+  case $ps in
+    D3cold) SS_CODE=deep  SS_TEXT="${c_grn}DEEP sleep (D3cold — fully powered off)${c_rst}" ;;
+    D3hot)  SS_CODE=light SS_TEXT="${c_ylw}light sleep (D3hot — powered, idle)${c_rst}" ;;
+    D0)
+      if [[ $rs == active ]]; then SS_CODE=active SS_TEXT="${c_red}awake (D0 — active)${c_rst}"
+      else SS_CODE=trans SS_TEXT="${c_ylw}transitioning (D0/${rs})${c_rst}"; fi ;;
+    *) SS_CODE=unknown SS_TEXT="${c_dim}unknown (power_state=${ps})${c_rst}" ;;
+  esac
+}
+
+has_nvpcf() { [[ -d /sys/bus/acpi/devices/NVDA0820:00 ]]; }
+
+# ------------------------------------------------------------------ processes
+# HOLDERS: pids (ascending) with an fd open on /dev/nvidia*. Only the link targets under
+# /proc/<pid>/fd are read -- the device nodes themselves are never opened. Bounded by a
+# deadline; other users' processes are invisible without root.
+scan_holders() {
+  HOLDERS=()
+  local -A seen=()
+  local dir pid
+  local procs=(/proc/[0-9]*/fd)
+  (( ${#procs[@]} )) || return 0
+  while IFS= read -r -d '' dir; do
+    pid=${dir#/proc/}
+    pid=${pid%/fd}
+    [[ $pid =~ ^[0-9]{1,10}$ ]] && seen[$pid]=1
+  done < <(timeout -k 1 10 find "${procs[@]}" -mindepth 1 -maxdepth 1 -lname '/dev/nvidia*' -printf '%h\0' 2>/dev/null)
+  (( ${#seen[@]} )) || return 0
+  mapfile -t HOLDERS < <(printf '%s\n' "${!seen[@]}" | sort -n)
+}
+
+# proc_comm <var> <pid>: the process name, restricted to a plain character set. It is also
+# used as an associative-array key, so nothing with shell meaning may survive.
+proc_comm() {
+  local _comm=''
+  IFS= read -r -n 64 _comm 2>/dev/null < "/proc/$2/comm" || true
+  _comm=${_comm:0:32}
+  _comm=${_comm//[^A-Za-z0-9._:+@\/ -]/?}
+  printf -v "$1" '%s' "${_comm:-?}"
+}
+
+# fd_counts <pid>: FD_NV = fds on /dev/nvidia*, FD_IGPU = fds on renderD128/card1.
+fd_counts() {
+  FD_NV=0 FD_IGPU=0
+  local t
+  while IFS= read -r -d '' t; do
+    case $t in
+      /dev/nvidia*) FD_NV=$(( FD_NV + 1 )) ;;
+      *renderD128*|*card1*) FD_IGPU=$(( FD_IGPU + 1 )) ;;
+    esac
+  done < <(timeout -k 1 5 find "/proc/$1/fd" -mindepth 1 -maxdepth 1 -printf '%l\0' 2>/dev/null)
+}
+
+# ------------------------------------------------------------------ who / status / sleep
+cmd_who() {
+  [[ -e /dev/nvidia0 ]] || die "no /dev/nvidia0 (is the NVIDIA driver loaded?)"
+  resolve_device || true
+  sleep_state
+  printf '%sProcesses on the NVIDIA dGPU%s %s—%s %s\n' "$c_bold" "$c_rst" "$c_dim" "$c_rst" "$SS_TEXT"
+  scan_holders
+  if (( ${#HOLDERS[@]} == 0 )); then
+    printf '  %snothing is using the dGPU%s — it can sleep.\n' "$c_grn" "$c_rst"
+    return 0
   fi
-  [ "$did" = 1 ] || die "found nothing to pin for '$name' (no PATH binary and no matching .desktop)"
-  echo "  ${c_dim}fully quit + relaunch $name for it to take effect.${c_rst}"
-}
-
-cmd_unpin() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: gpuwho unpin <command>"
-  local did=0 wrapper="$BINDIR/$name"
-  if [ -e "$wrapper" ]; then
-    if grep -q "$TAG" "$wrapper" 2>/dev/null; then rm -f "$wrapper"; echo "${c_grn}unpinned${c_rst} $name (wrapper removed)"; did=1
-    else echo "  ${c_dim}$wrapper is not ours — left alone${c_rst}"; fi
-  fi
-  local ds; ds=$(find_desktops "$name")
-  while IFS= read -r d; do [ -n "$d" ] && { remove_desktop_override "$d"; did=1; }; done <<<"$ds"
-  refresh_menu
-  [ "$did" = 1 ] || echo "  (nothing pinned for '$name')"
-  echo "  ${c_dim}restart $name to return to default GPU selection.${c_rst}"
-}
-
-cmd_listpins() {
-  local found=0 f
-  echo "${c_bold}terminal wrappers:${c_rst}"
-  for f in "$BINDIR"/*; do
-    [ -f "$f" ] && [ "$(basename "$f")" != gpuwho ] && grep -q "$TAG" "$f" 2>/dev/null \
-      && { echo "  $(basename "$f") -> $(grep -oE 'exec "[^"]+"' "$f" | sed 's/exec "//;s/"//')"; found=1; }
-  done
-  [ "$found" = 1 ] || echo "  ${c_dim}(none)${c_rst}"
-  found=0
-  echo "${c_bold}desktop overrides:${c_rst}"
-  for f in "$APPDIR"/*.desktop; do
-    [ -f "$f" ] && grep -q "$DTAG" "$f" 2>/dev/null \
-      && { echo "  $(basename "$f")$([ -e "$f.gpuwho-bak" ] && echo ' (backup kept)')"; found=1; }
-  done
-  [ "$found" = 1 ] || echo "  ${c_dim}(none)${c_rst}"
-}
-
-# ------------------------------------------------------------------ allow / unallow (dGPU opt-in)
-# Since the session defaults to iGPU-only (VK_LOADER_DRIVERS_DISABLE hides the NVIDIA ICD
-# from every app), the interesting operation is now the INVERSE of pin: granting one app
-# access back. Two strengths:
-#   allow <app>          -> gpu-unblock: dGPU becomes visible, app decides.  (game launchers)
-#   allow --force <app>  -> prime-run:   dGPU is forced for GL and Vulkan.   (one specific app)
-ATAG="X-GpuWho-Allowed=true"
-WTAG="# gpuwho-dgpu-allow"    # marks our allow wrappers in ~/.local/bin
-
-apply_desktop_allow() { # <src .desktop> <wrapper abs path>
-  local src="$1" wrap="$2" base ov inplace=0
-  base=$(basename "$src"); ov="$APPDIR/$base"; mkdir -p "$APPDIR"
-  [ "$(dirname "$src")" = "$APPDIR" ] && inplace=1
-  if [ -e "$ov" ] && grep -q "$ATAG" "$ov" 2>/dev/null; then echo "  already allowed: $ov"; return 0; fi
-  if [ "$inplace" = 1 ]; then cp -a "$src" "$ov.gpuwho-bak"; echo "  backed up original -> $ov.gpuwho-bak"
-  elif [ -e "$ov" ]; then cp -a "$ov" "$ov.gpuwho-bak"; echo "  ${c_ylw}backed up your existing override${c_rst} -> $ov.gpuwho-bak"; fi
-  # The wrapper is referenced by ABSOLUTE path on purpose: the graphical session's PATH
-  # does not include ~/.local/bin, so a bare name would silently fail to launch from the menu.
-  awk -v w="$wrap" -v tag="$ATAG" '
-    /^\[Desktop Entry\]/ { print; print tag; next }
-    /^Exec=/ {
-      line=substr($0,6)
-      if (index(line,w)>0) { print; next }                             # already wrapped
-      print "Exec=" w " " line; next
-    }
-    { print }
-  ' "$src" > "$ov.tmp" && mv "$ov.tmp" "$ov"
-  echo "  desktop allow: $ov ${c_dim}($([ "$inplace" = 1 ] && echo 'edited in place' || echo 'shadows system file'))${c_rst}"
-  command -v desktop-file-validate >/dev/null 2>&1 && desktop-file-validate "$ov" 2>&1 | grep -viE 'hint:' | sed 's/^/    validate: /' || true
-}
-
-cmd_allow() {
-  local force=0
-  [ "${1:-}" = "--force" ] && { force=1; shift; }
-  local name="${1:-}"; [ -n "$name" ] || die "usage: gpuwho allow [--force] <command|app>"
-  local wrap="$BINDIR/gpu-unblock"; [ "$force" = 1 ] && wrap="$BINDIR/prime-run"
-  [ -x "$wrap" ] || die "$wrap missing or not executable"
-  local ds did=0
-
-  # layer 1: PATH wrapper — covers terminal launches. Without this, `steam` typed in a
-  # shell inherits the session's iGPU-only default and every game it spawns sees only the
-  # Intel GPU, while the same launcher started from the menu works fine. Two layers are
-  # required because the graphical session's PATH does not include ~/.local/bin.
-  local real
-  if real=$(resolve_real "$name"); then
-    local wrapper="$BINDIR/$name"
-    if [ -e "$wrapper" ] && ! grep -q "$WTAG" "$wrapper" 2>/dev/null; then
-      echo "  ${c_ylw}$wrapper exists and is not ours — leaving it alone${c_rst}"
+  printf '  %s%-8s %-22s %-7s %s%s\n' "$c_dim" PID COMMAND NV-FDS MODE "$c_rst"
+  local pid comm mode
+  for pid in "${HOLDERS[@]}"; do
+    [[ -d /proc/$pid ]] || continue
+    proc_comm comm "$pid"
+    fd_counts "$pid"
+    if timeout -k 1 5 grep -qE '/dev/nvidia[0-9]' "/proc/$pid/maps" 2>/dev/null; then
+      mode="${c_red}rendering${c_rst}"
+    elif (( FD_IGPU > 0 )); then
+      mode="${c_ylw}holding (renders on Intel)${c_rst}"
     else
-      { echo "#!/usr/bin/env bash"; echo "$WTAG"
-        echo "# Lets '$name' reach the dGPU. Remove with: gpuwho unallow $name"
-        echo "exec \"$wrap\" \"$real\" \"\$@\""
-      } > "$wrapper"; chmod +x "$wrapper"
-      echo "  wrapper: $wrapper  ${c_dim}(-> $real)${c_rst}"; did=1
+      mode="${c_dim}holding${c_rst}"
     fi
-  fi
-
-  ds=$(find_desktops "$name")
-  if [ -n "$ds" ]; then
-    while IFS= read -r d; do [ -n "$d" ] && { echo "  ${c_bold}match:${c_rst} $d"; apply_desktop_allow "$d" "$wrap"; did=1; }; done <<<"$ds"
-    refresh_menu
-  fi
-  [ "$did" = 1 ] || die "no .desktop launcher found for '$name'"
-  echo "${c_grn}allowed${c_rst} $name -> dGPU $([ "$force" = 1 ] && echo 'FORCED (prime-run)' || echo 'available (app decides)')"
-  echo "  ${c_dim}fully quit + relaunch $name for it to take effect.${c_rst}"
+    printf '  %-8s %-22s %-7s %s\n' "$pid" "${comm:0:22}" "$FD_NV" "$mode"
+  done
+  echo
+  printf "  %s'rendering' processes keep the dGPU awake; it can sleep once they exit.%s\n" "$c_dim" "$c_rst"
 }
 
-cmd_unallow() {
-  local name="${1:-}"; [ -n "$name" ] || die "usage: gpuwho unallow <command|app>"
-  local ds did=0 base ov wrapper="$BINDIR/$name"
-  if [ -e "$wrapper" ] && grep -q "$WTAG" "$wrapper" 2>/dev/null; then
-    rm -f "$wrapper"; echo "  ${c_grn}removed wrapper${c_rst}: $wrapper"; did=1
-  fi
-  ds=$(find_desktops "$name")
-  while IFS= read -r d; do
-    [ -n "$d" ] || continue
-    base=$(basename "$d"); ov="$APPDIR/$base"; [ -e "$ov" ] || continue
-    grep -q "$ATAG" "$ov" 2>/dev/null || { echo "  ${c_dim}$ov is not ours — left alone${c_rst}"; continue; }
-    if [ -e "$ov.gpuwho-bak" ]; then mv -f "$ov.gpuwho-bak" "$ov"; echo "  ${c_grn}restored original launcher${c_rst}: $ov"
-    else rm -f "$ov"; echo "  removed allow override: $ov"; fi
-    did=1
-  done <<<"$ds"
-  refresh_menu
-  [ "$did" = 1 ] || echo "  (nothing allowed for '$name')"
+cmd_status() {
+  require_device
+  local st ctrl d3 ps asleep awake total pct
+  attr st power/runtime_status
+  attr ctrl power/control
+  attr d3 d3cold_allowed
+  attr ps power_state
+  attr_num asleep power/runtime_suspended_time
+  attr_num awake power/runtime_active_time
+  sleep_state
+  total=$(( asleep + awake ))
+  if (( total > 0 )); then pct=$(( (200 * asleep / total + 1) / 2 )); else pct='?'; fi
+  printf '%sdGPU power%s (%s)\n' "$c_bold" "$c_rst" "$NV_PCI"
+  printf '  runtime_status : %s\n' "$st"
+  printf '  power/control  : %s        %s(auto = RTD3 allowed)%s\n' "$ctrl" "$c_dim" "$c_rst"
+  printf '  d3cold_allowed : %s\n' "$d3"
+  printf '  power_state    : %s   %s(D0 awake / D3hot light / D3cold deep)%s\n' "$ps" "$c_dim" "$c_rst"
+  printf '  right now      : %s\n' "$SS_TEXT"
+  printf '  asleep         : %s h\n' "$(hours "$asleep")"
+  printf '  awake          : %s h\n' "$(hours "$awake")"
+  printf '  %sasleep %s%% of the time%s  %s(higher = more battery saved)%s\n' \
+    "$c_bold" "$pct" "$c_rst" "$c_dim" "$c_rst"
+}
+
+# Quick one-liner; exit status 0 iff the dGPU is in deep sleep (scriptable).
+cmd_sleep() {
+  require_device
+  local ps rs
+  sleep_state
+  attr ps power_state
+  attr rs power/runtime_status
+  printf 'dGPU: %s  %s[power_state=%s, runtime=%s]%s\n' "$SS_TEXT" "$c_dim" "$ps" "$rs" "$c_rst"
+  [[ $SS_CODE == deep ]]
 }
 
 # ------------------------------------------------------------------ watch
-# Attribute dGPU wakes to the process that caused them.
+# Attribute dGPU wakes to the process that caused them, from power_state and /proc only.
 #
-# Everything here is sysfs + /proc ONLY. Opening /dev/nvidia* (or reading
-# current_link_speed, or shelling out to nvidia-smi) would resume the GPU, so the
-# watcher would manufacture the very wakes it claims to observe. Do not add any of those.
-gpu_holders() {
-  local p comm out=''
-  for p in /proc/[0-9]*; do
-    [ -d "$p/fd" ] || continue
-    ls -l "$p/fd" 2>/dev/null | grep -q '/dev/nvidia' || continue
-    comm=$(cat "$p/comm" 2>/dev/null) || continue
-    out="${out:+$out }${comm}(${p#/proc/})"
-  done
-  printf '%s' "$out"
+# A compositor keeps /dev/nvidia* open from login to logout, so "who holds it at wake time"
+# would name it for EVERY wake. Residents are snapshotted up front and only newcomers are
+# reported as suspects. Tallies live in associative arrays -- nothing touches the disk.
+#
+# NVPCF (ACPI HID NVDA0820) is how the embedded controller negotiates power and thermal
+# budget with the GPU. A firmware Notify on it makes the driver take a runtime-PM
+# reference, so the card powers up with no process behind it -- invisible to any fd scan.
+declare -A TALLY=() RESIDENT=()
+W_START=0 W_PREV='' W_WAKES=0 W_AWAKE=0 W_WSTART=0 W_MISSED=0
+
+watch_summary() {
+  trap - INT TERM
+  local total=$(( EPOCHSECONDS - W_START )) name t
+  if [[ $W_PREV == D0 ]] && (( W_WSTART != 0 )); then
+    W_AWAKE=$(( W_AWAKE + EPOCHSECONDS - W_WSTART ))
+    W_WSTART=0
+  fi
+  echo
+  printf '%ssummary%s %sover %ss%s\n' "$c_bold" "$c_rst" "$c_dim" "$total" "$c_rst"
+  printf '  wakes        : %s\n' "$W_WAKES"
+  printf '  awake        : %ss' "$W_AWAKE"
+  if (( total > 0 )); then
+    t=$(( (2000 * W_AWAKE / total + 1) / 2 ))
+    printf '  (%d.%d%% of the window)' $(( t / 10 )) $(( t % 10 ))
+  fi
+  echo
+  # A process polling nvidia-smi on a timer never lets the card idle, so it produces ZERO
+  # wake events -- the card simply never sleeps. Counting wakes alone would report that
+  # as a quiet, healthy window, which is exactly backwards.
+  if (( W_WAKES == 0 && total >= 20 )) && [[ $W_PREV == D0 ]]; then
+    echo
+    printf '  %sThe dGPU never slept during this window.%s\n' "$c_red" "$c_rst"
+    printf '  %sZero wakes here does not mean idle — it means something is HOLDING the card,\n' "$c_dim"
+    printf '  not waking it. A holder shows no wake events at all, so watching for wakes will\n'
+    printf '  never find it. Look for a poller instead:%s\n' "$c_rst"
+    printf '    %snvidia-smi on a timer (system-monitor bar widgets are the usual culprit)%s\n' "$c_dim" "$c_rst"
+    printf '    %sanything with /dev/nvidia* open: %sgpuwho%s lists them%s\n' "$c_dim" "$c_rst" "$c_dim" "$c_rst"
+  fi
+  if (( ${#TALLY[@]} )); then
+    printf '  %snewly-arrived holders at wake time%s\n' "$c_bold" "$c_rst"
+    for name in "${!TALLY[@]}"; do
+      printf '    %7d %s\n' "${TALLY["$name"]}" "$name"
+    done | sort -rn | head -8
+  else
+    printf '  %sno holder caught in this window%s\n' "$c_dim" "$c_rst"
+    if has_nvpcf; then
+      printf '  %sthis machine has an NVPCF device — see %sgpuwho why%s for what that means.%s\n' \
+        "$c_dim" "$c_rst" "$c_dim" "$c_rst"
+    fi
+  fi
+  if (( W_MISSED > 0 )); then
+    printf '  %s%d wake(s) had no holder%s %s— the process exited between samples.%s\n' \
+      "$c_ylw" "$W_MISSED" "$c_rst" "$c_dim" "$c_rst"
+    printf '  %scatch them with: GPUWHO_POLL=0.25 gpuwho watch%s\n' "$c_dim" "$c_rst"
+  fi
+  if (( EUID != 0 )); then
+    printf '  %sprocesses of other users (e.g. nvidia-persistenced) are invisible to this scan.%s\n' \
+      "$c_dim" "$c_rst"
+  fi
 }
 
-# A compositor keeps /dev/nvidia* open from login to logout. Naively reporting "who holds
-# it" at wake time therefore names that compositor for EVERY wake, including wakes it had
-# nothing to do with -- which reads as a mystery leak when it is really just a permanent
-# resident. So snapshot the residents up front and report only the newcomers as suspects.
-RESIDENTS=''
-# NVPCF (ACPI HID NVDA0820) is how the laptop's embedded controller negotiates power and
-# thermal budget with the GPU. When the firmware raises a Notify on it, the NVIDIA driver
-# takes a runtime-PM reference to answer -- so the card powers up with no process behind
-# it. Wakes like that are invisible to every userspace check, which is exactly what makes
-# them look like an unexplained leak.
-has_nvpcf() { [ -d /sys/bus/acpi/devices/NVDA0820:00 ]; }
-snapshot_residents() { RESIDENTS=" $(gpu_holders | sed 's/([0-9]*)//g') "; }
-is_resident() { case "$RESIDENTS" in *" $1 "*) return 0;; *) return 1;; esac; }
-
 cmd_watch() {
-  local dur="${1:-0}" poll="${GPUWHO_POLL:-1}"
-  case "$dur" in (*[!0-9]*) die "usage: gpuwho watch [seconds]   (omit for until-Ctrl-C)";; esac
-  [ -e "$NV_SYS/power_state" ] || die "no NVIDIA device at $NV_PCI"
+  local dur=$1 poll=${GPUWHO_POLL:-1} ms ip fp
+  [[ $dur =~ ^[0-9]{1,5}$ ]] && (( 10#$dur <= 86400 )) \
+    || die "usage: gpuwho watch [seconds]   (0-86400; omit or 0 for until Ctrl-C)"
+  dur=$(( 10#$dur ))
+  [[ $poll =~ ^([0-9]{1,2})(\.([0-9]{1,3}))?$ ]] \
+    || die "GPUWHO_POLL must be a number of seconds between 0.1 and 60"
+  ip=${BASH_REMATCH[1]} fp=${BASH_REMATCH[3]}000
+  ms=$(( 10#$ip * 1000 + 10#${fp:0:3} ))
+  (( ms >= 100 && ms <= 60000 )) || die "GPUWHO_POLL must be a number of seconds between 0.1 and 60"
+  printf -v poll '%d.%03d' $(( ms / 1000 )) $(( ms % 1000 ))
+  require_device
 
-  local tally; tally=$(mktemp); trap 'rm -f "$tally"' EXIT
-  local start end prev='' wakes=0 awake=0 wstart=0 missed=0 now ps holders
+  local end=0 ps now holders pid comm names
+  W_START=$EPOCHSECONDS
+  (( dur > 0 )) && end=$(( W_START + dur ))
 
-  start=$(date +%s); end=0
-  [ "$dur" -gt 0 ] && end=$((start + dur))
+  printf '%sWatching the dGPU%s %s— poll %ss, sysfs only (does not wake it)%s\n' "$c_bold" "$c_rst" "$c_dim" "$poll" "$c_rst"
+  if (( end != 0 )); then names="for ${dur}s"; else names="until Ctrl-C"; fi
+  printf '%s%s · a wake shows what held /dev/nvidia* at that moment%s\n\n' "$c_dim" "$names" "$c_rst"
 
-  echo "${c_bold}Watching the dGPU${c_rst} ${c_dim}— poll ${poll}s, sysfs only (does not wake it)${c_rst}"
-  echo "${c_dim}$([ "$end" != 0 ] && echo "for ${dur}s" || echo "until Ctrl-C") · a wake shows what held /dev/nvidia* at that moment${c_rst}"
-  echo
+  trap 'watch_summary; exit 0' INT TERM
 
-  _watch_summary() {
-    local total=$(( $(date +%s) - start ))
-    [ "$prev" = D0 ] && [ "$wstart" != 0 ] && awake=$(( awake + $(date +%s) - wstart ))
-    echo
-    echo "${c_bold}summary${c_rst} ${c_dim}over ${total}s${c_rst}"
-    printf '  wakes        : %s\n' "$wakes"
-    printf '  awake        : %ss' "$awake"
-    [ "$total" -gt 0 ] && awk -v a="$awake" -v t="$total" 'BEGIN{printf "  (%.1f%% of the window)", 100*a/t}'
-    echo
-    # A process that polls nvidia-smi on a timer never lets the card idle, so it produces
-    # ZERO wake events -- the card simply never sleeps. Counting wakes alone reports that
-    # as a quiet, healthy window, which is exactly backwards. Call it out explicitly.
-    if [ "$wakes" = 0 ] && [ "$prev" = D0 ] && [ "$total" -ge 20 ]; then
-      echo
-      echo "  ${c_red}The dGPU never slept during this window.${c_rst}"
-      echo "  ${c_dim}Zero wakes here does not mean idle — it means something is HOLDING the card,"
-      echo "  not waking it. A holder shows no wake events at all, so watching for wakes will"
-      echo "  never find it. Look for a poller instead:${c_rst}"
-      echo "    ${c_dim}nvidia-smi on a timer (system-monitor bar widgets are the usual culprit)${c_rst}"
-      echo "    ${c_dim}anything with /dev/nvidia* open: ${c_rst}gpuwho${c_dim} lists them${c_rst}"
-    fi
-    if [ -s "$tally" ]; then
-      echo "  ${c_bold}newly-arrived holders at wake time${c_rst}"
-      sort "$tally" | uniq -c | sort -rn | head -8 | sed "s/^/    /"
-    else
-      echo "  ${c_dim}no holder caught in this window${c_rst}"
-      has_nvpcf && echo "  ${c_dim}this machine has an NVPCF device — see ${c_rst}gpuwho why${c_dim} for what that means.${c_rst}"
-    fi
-    # only nag about resolution when attribution actually failed
-    if [ "$missed" -gt 0 ]; then
-      echo "  ${c_ylw}$missed wake(s) had no holder${c_rst} ${c_dim}— the process exited between samples.${c_rst}"
-      echo "  ${c_dim}catch them with: GPUWHO_POLL=0.25 gpuwho watch${c_rst}"
-    fi
-    # This matters more than it sounds: nvidia-persistenced runs as its own user and
-    # holds /dev/nvidia* for the whole uptime, so an unprivileged watch cannot see it and
-    # will happily pin every wake on the compositor instead.
-    if [ "$(id -u)" != 0 ]; then
-      echo "  ${c_dim}root-owned holders (e.g. nvidia-persistenced) are invisible here —"
-      echo "  re-run as ${c_rst}sudo gpuwho watch${c_dim} to see them.${c_rst}"
-    fi
-  }
-  trap '_watch_summary; rm -f "$tally"; exit 0' INT TERM
-
-  # Establish the starting state as a BASELINE, not a wake. Without this, opening the
-  # window while the GPU happens to be awake counts as a wake with no holder, which reads
-  # as a mystery wake when it is really just the initial condition.
-  prev=$(cat "$NV_SYS/power_state" 2>/dev/null || echo '?')
-  snapshot_residents
-  [ -n "${RESIDENTS// /}" ] && printf '  %b%s%b\n' "$c_dim" \
-    "resident holders (open /dev/nvidia* for the whole session):${RESIDENTS%% }" "$c_rst"
-  if [ "$prev" = D0 ]; then
-    wstart=$start
-    printf '  %s  %b%-7s%b %s\n' "$(date +%H:%M:%S)" "$c_dim" "$prev" "$c_rst" \
-      "${c_dim}(already awake when watching started — baseline, not a wake)${c_rst}"
+  # The starting state is a BASELINE, not a wake: opening the window while the GPU happens
+  # to be awake would otherwise count as a wake with no holder.
+  attr W_PREV power_state
+  scan_holders
+  for pid in "${HOLDERS[@]}"; do
+    proc_comm comm "$pid"
+    RESIDENT["$comm"]=1
+  done
+  if (( ${#RESIDENT[@]} )); then
+    names=$(printf '%s\n' "${!RESIDENT[@]}" | sort | tr '\n' ' ')
+    printf '  %sresident holders (open /dev/nvidia* for the whole session): %s%s\n' "$c_dim" "${names% }" "$c_rst"
+  fi
+  printf -v now '%(%H:%M:%S)T' -1
+  if [[ $W_PREV == D0 ]]; then
+    W_WSTART=$W_START
+    printf '  %s  %s%-7s%s %s(already awake when watching started — baseline, not a wake)%s\n' \
+      "$now" "$c_dim" "$W_PREV" "$c_rst" "$c_dim" "$c_rst"
   else
-    printf '  %s  %b%-7s%b %s\n' "$(date +%H:%M:%S)" "$c_dim" "$prev" "$c_rst" \
-      "${c_dim}(baseline)${c_rst}"
+    printf '  %s  %s%-7s%s %s(baseline)%s\n' "$now" "$c_dim" "$W_PREV" "$c_rst" "$c_dim" "$c_rst"
   fi
 
   while :; do
-    ps=$(cat "$NV_SYS/power_state" 2>/dev/null || echo '?')
-    if [ "$ps" != "$prev" ]; then
-      now=$(date +%H:%M:%S)
-      if [ "$ps" = D0 ]; then
-        wakes=$((wakes + 1)); wstart=$(date +%s)
-        local h base new_h='' res_h=''
-        for h in $(gpu_holders); do
-          base=${h%%(*}
-          if is_resident "$base"; then res_h="${res_h:+$res_h }$h"; else new_h="${new_h:+$new_h }$h"; fi
+    attr ps power_state
+    if [[ $ps != "$W_PREV" ]]; then
+      printf -v now '%(%H:%M:%S)T' -1
+      if [[ $ps == D0 ]]; then
+        W_WAKES=$(( W_WAKES + 1 ))
+        W_WSTART=$EPOCHSECONDS
+        local new_h=() res_h=()
+        scan_holders
+        for pid in "${HOLDERS[@]}"; do
+          proc_comm comm "$pid"
+          if [[ ${RESIDENT["$comm"]+x} ]]; then
+            res_h+=("$comm($pid)")
+          else
+            new_h+=("$comm($pid)")
+            TALLY["$comm"]=$(( ${TALLY["$comm"]:-0} + 1 ))
+          fi
         done
-        if [ -n "$new_h" ]; then
-          printf '%s\n' $new_h | sed 's/([0-9]*)$//' >> "$tally"
-          holders="$new_h"
-        elif [ -n "$res_h" ]; then
-          # Only long-lived residents were holding it. One of them poked the card, but the
-          # fd list cannot say which -- claiming otherwise would be a guess dressed as data.
+        if (( ${#new_h[@]} )); then
+          holders="${new_h[*]}"
+        elif (( ${#res_h[@]} )); then
+          # Only long-lived residents were holding it. One of them may have poked the
+          # card, but the fd list cannot say which -- claiming otherwise would be a guess.
           if has_nvpcf; then
             holders="${c_dim}no new process — a short-lived config-space reader or a firmware notify (gpuwho why)${c_rst}"
           else
-            holders="${c_dim}only resident holders ($res_h) — no new process; cause not attributable from fds${c_rst}"
+            holders="${c_dim}only resident holders (${res_h[*]}) — no new process; cause not attributable from fds${c_rst}"
           fi
         else
-          missed=$((missed + 1))
+          W_MISSED=$(( W_MISSED + 1 ))
+          holders="${c_dim}<nothing held it — short-lived waker>${c_rst}"
         fi
-        printf '  %s  %b%-7s%b %s\n' "$now" "$c_red" "$ps" "$c_rst" \
-          "${holders:-${c_dim}<nothing held it — short-lived waker>${c_rst}}"
+        printf '  %s  %s%-7s%s %s\n' "$now" "$c_red" "$ps" "$c_rst" "$holders"
       else
-        if [ "$prev" = D0 ] && [ "$wstart" != 0 ]; then
-          awake=$(( awake + $(date +%s) - wstart )); wstart=0
+        if [[ $W_PREV == D0 ]] && (( W_WSTART != 0 )); then
+          W_AWAKE=$(( W_AWAKE + EPOCHSECONDS - W_WSTART ))
+          W_WSTART=0
         fi
-        local col=$c_grn; [ "$ps" = D3hot ] && col=$c_ylw
-        printf '  %s  %b%-7s%b\n' "$now" "$col" "$ps" "$c_rst"
+        local col=$c_grn
+        [[ $ps == D3hot ]] && col=$c_ylw
+        printf '  %s  %s%-7s%s\n' "$now" "$col" "$ps" "$c_rst"
       fi
-      prev=$ps
+      W_PREV=$ps
     fi
-    [ "$end" != 0 ] && [ "$(date +%s)" -ge "$end" ] && break
+    (( end != 0 && EPOCHSECONDS >= end )) && break
     sleep "$poll"
   done
-  _watch_summary
+  watch_summary
 }
 
 # ------------------------------------------------------------------ why
-# Explain wakes that no userspace tool can attribute, and hand over the one method that
-# actually answers the question. Everything below is read-only except the trace arming,
-# which is reverted before returning.
+# Explain wakes that no userspace tool can attribute, and print (never run) the root-only
+# recipes that actually answer the question.
 cmd_why() {
-  echo "${c_bold}Why the dGPU wakes with nothing running${c_rst}"
-  echo
+  resolve_device || true
+  local addr=${NV_PCI:-<pci-address>}
+  printf '%sWhy the dGPU wakes with nothing running%s\n\n' "$c_bold" "$c_rst"
   if has_nvpcf; then
-    echo "  This laptop exposes ${c_bold}NVDA0820${c_rst} (NVPCF) — the ACPI interface the embedded"
-    echo "  controller uses to negotiate power and thermal budget with the GPU."
-    echo
-    echo "  When the firmware raises a Notify on it, the NVIDIA driver answers like this:"
-    echo "    ${c_dim}acpi_ev_notify_dispatch -> rm_acpi_nvpcf_notify -> os_ref_dynamic_power${c_rst}"
-    echo "    ${c_dim}  -> nv_indicate_not_idle -> __pm_runtime_resume${c_rst}"
-    echo
-    echo "  nv_indicate_not_idle takes a runtime-PM reference, so the card powers up purely"
-    echo "  to service the notification, then suspends again. ${c_bold}No process is involved${c_rst} —"
-    echo "  which is why fd listings, /proc polling and udev monitoring all come up empty."
-    echo
-    echo "  This is the platform working as designed, not a leak. It happens in bursts tied"
-    echo "  to AC/battery, thermal and load changes rather than on a fixed interval."
-    echo "  ${c_dim}nvidia-powerd does not need to be running for it to occur, and the ~18s tail${c_rst}"
-    echo "  ${c_dim}is not tunable: power/autosuspend_delay_ms returns EIO because the driver${c_rst}"
-    echo "  ${c_dim}does not use the PM core's autosuspend at all.${c_rst}"
-    echo
-    echo "  ${c_bold}Before blaming firmware, rule out a config-space reader.${c_rst} A desktop shell that"
-    echo "  re-runs hardware probes (menu state, bar widgets) can call ${c_dim}lspci${c_rst} on a loop and"
-    echo "  produce exactly the same symptom — periodic wakes with no lasting process. That"
-    echo "  is far more common, and unlike NVPCF it is fixable. Check with:"
-    echo "    ${c_dim}sudo auditctl -a always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake${c_rst}"
-    echo "    ${c_dim}sudo ausearch -k lspciwake${c_rst}   ${c_dim}# then match timestamps against wakes${c_rst}"
+    cat <<EOS
+  This laptop exposes ${c_bold}NVDA0820${c_rst} (NVPCF) — the ACPI interface the embedded
+  controller uses to negotiate power and thermal budget with the GPU.
+
+  When the firmware raises a Notify on it, the NVIDIA driver answers like this:
+    ${c_dim}acpi_ev_notify_dispatch -> rm_acpi_nvpcf_notify -> os_ref_dynamic_power${c_rst}
+    ${c_dim}  -> nv_indicate_not_idle -> __pm_runtime_resume${c_rst}
+
+  nv_indicate_not_idle takes a runtime-PM reference, so the card powers up purely
+  to service the notification, then suspends again. ${c_bold}No process is involved${c_rst} —
+  which is why fd listings, /proc polling and udev monitoring all come up empty.
+
+  This is the platform working as designed, not a leak. It happens in bursts tied
+  to AC/battery, thermal and load changes rather than on a fixed interval.
+  ${c_dim}nvidia-powerd does not need to be running for it to occur, and the ~18s tail${c_rst}
+  ${c_dim}is not tunable: power/autosuspend_delay_ms returns EIO because the driver${c_rst}
+  ${c_dim}does not use the PM core's autosuspend at all.${c_rst}
+
+  ${c_bold}Before blaming firmware, rule out a config-space reader.${c_rst} A desktop shell that
+  re-runs hardware probes (menu state, bar widgets) can call ${c_dim}lspci${c_rst} on a loop and
+  produce exactly the same symptom — periodic wakes with no lasting process. That
+  is far more common, and unlike NVPCF it is fixable. Check with:
+    ${c_dim}sudo auditctl -a always,exit -F path=/usr/bin/lspci -F perm=x -k lspciwake${c_rst}
+    ${c_dim}sudo ausearch -k lspciwake${c_rst}   ${c_dim}# then match timestamps against wakes${c_rst}
+EOS
   else
-    echo "  ${c_dim}No NVPCF device (NVDA0820) on this machine, so firmware notifies are not${c_rst}"
-    echo "  ${c_dim}the usual explanation here.${c_rst}"
+    printf '  %sNo NVPCF device (NVDA0820) on this machine, so firmware notifies are not%s\n' "$c_dim" "$c_rst"
+    printf '  %sthe usual explanation here.%s\n' "$c_dim" "$c_rst"
   fi
   echo
-  echo "${c_bold}Confirm it yourself${c_rst} ${c_dim}(needs root; reverts when done)${c_rst}"
+  printf '%sConfirm it yourself%s %s(needs root; reverts when done)%s\n' "$c_bold" "$c_rst" "$c_dim" "$c_rst"
+  [[ -n $NV_PCI ]] || printf '  %sno device is bound to the nvidia driver right now; put its PCI address in the filter%s\n' "$c_dim" "$c_rst"
+  # addr is either a validated PCI address or the fixed placeholder, so it is inert here.
   cat <<EOS
     sudo sh -c 'T=/sys/kernel/tracing
       echo 0 > \$T/tracing_on; : > \$T/trace
       echo 1 > \$T/events/rpm/rpm_resume/enable
-      echo "name ~ \\"$NV_PCI\\"" > \$T/events/rpm/rpm_resume/filter
+      echo "name ~ \\"$addr\\"" > \$T/events/rpm/rpm_resume/filter
       echo 1 > \$T/options/stacktrace; echo 1 > \$T/tracing_on
       sleep 300; cat \$T/trace
       echo 0 > \$T/tracing_on
@@ -528,63 +429,55 @@ cmd_why() {
       echo 0 > \$T/options/stacktrace
       : > \$T/events/rpm/rpm_resume/filter'
 EOS
-  echo
-  echo "  ${c_dim}The tracepoint fires inside the kernel, so unlike a /proc poller it cannot be${c_rst}"
-  echo "  ${c_dim}outrun by a short-lived process. The filter field is 'name', not 'dev_name' —${c_rst}"
-  echo "  ${c_dim}getting that wrong silently traces every device instead of just this one.${c_rst}"
-  echo
-  echo "${c_bold}Other things that genuinely wake it${c_rst}"
-  echo "  ${c_dim}lspci / setpci${c_rst}  read PCI config space; the kernel resumes the card to answer"
-  echo "  ${c_dim}nvidia-smi${c_rst}      talks to the driver directly"
-  echo "  ${c_dim}current_link_speed${c_rst} and other config-space sysfs attributes"
-  echo "  ${c_dim}This tool reads only power_state and power/*, which never wake it.${c_rst}"
+  cat <<EOS
+
+  ${c_dim}The tracepoint fires inside the kernel, so unlike a /proc poller it cannot be${c_rst}
+  ${c_dim}outrun by a short-lived process. The filter field is 'name', not 'dev_name' —${c_rst}
+  ${c_dim}getting that wrong silently traces every device instead of just this one.${c_rst}
+
+${c_bold}Other things that genuinely wake it${c_rst}
+  ${c_dim}lspci / setpci${c_rst}  read PCI config space; the kernel resumes the card to answer
+  ${c_dim}nvidia-smi${c_rst}      talks to the driver directly
+  ${c_dim}current_link_speed${c_rst} and other config-space sysfs attributes
+  ${c_dim}This tool reads only power_state, power/* and d3cold_allowed, which never wake it.${c_rst}
+EOS
 }
 
-# ------------------------------------------------------------------ policy overview
-cmd_policy() {
-  local envf="$HOME/.config/environment.d/90-gpu-default-igpu.conf" live=0
-  echo "${c_bold}GPU policy${c_rst}"
-  if [ -f "$envf" ]; then echo "  default        : ${c_grn}iGPU only${c_rst} ${c_dim}(NVIDIA Vulkan ICD hidden session-wide)${c_rst}"
-  else echo "  default        : ${c_ylw}not installed${c_rst} ${c_dim}($envf missing)${c_rst}"; fi
-  [ -n "${VK_LOADER_DRIVERS_DISABLE:-}" ] && live=1
-  echo "  active in shell: $([ "$live" = 1 ] && echo "${c_grn}yes${c_rst} (VK_LOADER_DRIVERS_DISABLE=$VK_LOADER_DRIVERS_DISABLE)" || echo "${c_ylw}no — log out and back in to apply${c_rst}")"
-  echo "  opt-in         : ${c_bold}prime-run <app>${c_rst} ${c_dim}(force dGPU)${c_rst} · ${c_bold}gpuwho allow <app>${c_rst} ${c_dim}(make dGPU available)${c_rst}"
-  echo
-  echo "${c_bold}apps allowed on the dGPU:${c_rst}"
-  local found=0 f
-  for f in "$BINDIR"/*; do
-    [ -f "$f" ] && [ "$(basename "$f")" != gpuwho ] && grep -q "$WTAG" "$f" 2>/dev/null && printf '  %-42s %s\n' "$(basename "$f")" "${c_dim}available (terminal)${c_rst}" && found=1
-  done
-  for f in "$APPDIR"/*.desktop; do
-    [ -f "$f" ] && grep -q "$ATAG" "$f" 2>/dev/null && {
-      printf '  %-42s %s\n' "$(basename "$f")" \
-        "$(grep -q "$BINDIR/prime-run" "$f" && echo "${c_ylw}forced${c_rst}" || echo "${c_dim}available${c_rst}")"; found=1; }
-  done
-  [ "$found" = 1 ] || echo "  ${c_dim}(none)${c_rst}"
-  echo
-  echo "${c_bold}legacy iGPU pins${c_rst} ${c_dim}(redundant now the default is iGPU — 'gpuwho unpin <name>' to clear)${c_rst}"
-  found=0
-  for f in "$BINDIR"/*; do
-    [ -f "$f" ] && [ "$(basename "$f")" != gpuwho ] && grep -q "$TAG" "$f" 2>/dev/null && { echo "  $(basename "$f")"; found=1; }
-  done
-  for f in "$APPDIR"/*.desktop; do
-    [ -f "$f" ] && grep -q "$DTAG" "$f" 2>/dev/null && { echo "  $(basename "$f")"; found=1; }
-  done
-  [ "$found" = 1 ] || echo "  ${c_dim}(none)${c_rst}"
+# ------------------------------------------------------------------ help / dispatch
+usage() {
+  cat <<'EOF'
+gpuwho — what is keeping the NVIDIA discrete GPU awake (read-only)
+
+  gpuwho                 list processes that hold the dGPU open
+  gpuwho status          power state, runtime PM settings, time asleep
+  gpuwho sleep           is it in deep sleep (D3cold) right now? exit 0 = yes
+  gpuwho watch [secs]    log every wake and name what held the GPU (omit: until Ctrl-C)
+  gpuwho why             why it can wake with nothing running, and how to trace it
+  gpuwho help            this text
+
+  GPUWHO_POLL=<secs>     sampling interval for watch, 0.1 to 60 (default 1)
+
+Reads only /proc and the dGPU's sysfs power attributes, so it never wakes the GPU.
+It changes nothing and writes no files.
+EOF
 }
 
-case "${1:-who}" in
-  ""|who|ps|list)  cmd_who ;;
-  status|state)    cmd_status ;;
-  sleep|deep|deepsleep) cmd_sleep ;;
-  policy)          cmd_policy ;;
-  watch)           cmd_watch "${2:-0}" ;;
-  why|explain)     cmd_why ;;
-  allow)           shift; cmd_allow "$@" ;;
-  unallow)         cmd_unallow "${2:-}" ;;
-  pin)             cmd_pin "${2:-}" ;;
-  unpin)           cmd_unpin "${2:-}" ;;
-  list-pins|pins)  cmd_listpins ;;
-  -h|--help|help)  sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//' ;;
-  *) die "unknown command '$1' (try: gpuwho --help)" ;;
-esac
+no_args() {
+  (( $1 == 0 )) || die "'$2' takes no arguments (try: gpuwho help)"
+}
+
+main() {
+  local cmd=${1:-who}
+  (( $# > 0 )) && shift
+  case $cmd in
+    who|ps|list)          no_args $# "$cmd"; cmd_who ;;
+    status|state)         no_args $# "$cmd"; cmd_status ;;
+    sleep|deep|deepsleep) no_args $# "$cmd"; cmd_sleep ;;
+    watch)                (( $# <= 1 )) || die "usage: gpuwho watch [seconds]"; cmd_watch "${1:-0}" ;;
+    why|explain)          no_args $# "$cmd"; cmd_why ;;
+    help|-h|--help)       no_args $# "$cmd"; usage ;;
+    *)                    die "unknown command '$cmd' (try: gpuwho help)" ;;
+  esac
+}
+
+main "$@"

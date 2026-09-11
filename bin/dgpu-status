@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""dgpu-status -- the bar widget's one helper.
+
+  dgpu-status device    print the sysfs directory of the PCI device bound to the
+                        nvidia driver; exit 1 (and print nothing) if there is none
+
+The widget runs this once at startup, then reads the power attributes itself with
+FileView. It is resolved from the driver's own binding rather than a hardcoded address,
+because the dGPU is not at the same PCI address on every laptop.
+
+Nothing here opens a file of the device. It lists one driver directory, resolves a
+symlink and checks that power_state exists -- directory and inode operations only, which
+never reach PCI config space and so never wake a sleeping GPU. Do not add reads of
+`config`, `current_link_speed` or `current_link_width`: each of those resumes the card.
+"""
+import os
+import re
+import stat
+import sys
+
+# Domain:bus:device.function, lowercase hex, exactly as the kernel names PCI devices.
+BDF = re.compile(r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]")
+# What a resolved path may contain below <sysfs>/devices/. The widget re-checks this.
+DEVICE_PATH_CHARS = re.compile(r"[A-Za-z0-9:._/-]{1,200}")
+MAX_ENTRIES = 256
+
+
+def resolve_device(sysfs_root="/sys"):
+    """Absolute sysfs directory of the first nvidia-bound PCI device, or None.
+
+    An entry counts only if its name is a PCI address, it resolves to a directory of the
+    same name under <sysfs_root>/devices/, and that directory has a regular power_state
+    attribute. The root is a parameter so tests can use a fake tree."""
+    root = os.path.realpath(sysfs_root)
+    driver = os.path.join(root, "bus", "pci", "drivers", "nvidia")
+    devices = os.path.join(root, "devices") + os.sep
+    names = []
+    try:
+        with os.scandir(driver) as entries:
+            for count, entry in enumerate(entries):
+                if count >= MAX_ENTRIES:
+                    break
+                if BDF.fullmatch(entry.name):
+                    names.append(entry.name)
+    except OSError:
+        return None
+    for name in sorted(names):
+        real = os.path.realpath(os.path.join(driver, name))
+        if not real.startswith(devices) or os.path.basename(real) != name:
+            continue
+        if not DEVICE_PATH_CHARS.fullmatch(real[len(devices):]):
+            continue
+        try:
+            if not stat.S_ISDIR(os.lstat(real).st_mode):
+                continue
+            if not stat.S_ISREG(os.lstat(os.path.join(real, "power_state")).st_mode):
+                continue
+        except OSError:
+            continue
+        return real
+    return None
+
+
+def main(argv):
+    if argv[1:] != ["device"]:
+        print("usage: dgpu-status device", file=sys.stderr)
+        return 2
+    path = resolve_device()
+    if path is None:
+        return 1
+    print(path)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
